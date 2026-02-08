@@ -4,71 +4,91 @@ pragma solidity ^0.8.24;
 import {AMMStrategyBase} from "./AMMStrategyBase.sol";
 import {IAMMStrategy, TradeInfo} from "./IAMMStrategy.sol";
 
-/// @title Volume TWAP Strategy
-/// @notice Tracks a 10-step rolling volume TWAP using a circular buffer.
-///         If an incoming swap's size exceeds the TWAP, spike the fee by 25 bps.
+/// @title Volume TWAP Strategy (150-step window)
+/// @notice Tracks a 150-step rolling volume TWAP using 15 bucketed slots
+///         (each bucket covers 10 consecutive steps). If an incoming swap's
+///         size exceeds the TWAP, spike the fee by 25 bps.
 ///
 /// Slot layout:
-///   0-9:  Circular buffer — cumulative trade volume per step (WAD)
-///   10:   Current write index in the circular buffer
-///   11:   Timestamp of the last trade seen
-///   12:   Cached sum of all 10 buffer slots
-///   13:   Total steps observed (for warmup gating)
+///   0-14:  Bucketed circular buffer — total volume per 10-step epoch
+///   15:    Last epoch index + 1 (0 = uninitialized)
+///   16:    Last timestamp + 1   (0 = uninitialized)
+///   17:    Cached sum of all 15 buckets
+///   18:    Total steps observed (for warmup gating)
 contract Strategy is AMMStrategyBase {
     uint256 public constant BASE_FEE = 30 * BPS;
     uint256 public constant SPIKE_ADD = 25 * BPS;
-    uint256 public constant WINDOW = 10;
+    uint256 public constant NUM_BUCKETS = 15;
+    uint256 public constant STEPS_PER_BUCKET = 10;
+    uint256 public constant WINDOW = 150; // NUM_BUCKETS * STEPS_PER_BUCKET
 
-    // Metadata slot indices (after the 10-slot buffer)
-    uint256 private constant SLOT_IDX = 10;
-    uint256 private constant SLOT_LAST_TS = 11;
-    uint256 private constant SLOT_SUM = 12;
-    uint256 private constant SLOT_STEPS = 13;
+    // Metadata slot indices (after the 15-slot bucket buffer)
+    uint256 private constant SLOT_LAST_EPOCH = 15; // stored as epoch + 1
+    uint256 private constant SLOT_LAST_TS = 16;    // stored as timestamp + 1
+    uint256 private constant SLOT_SUM = 17;
+    uint256 private constant SLOT_STEPS = 18;
 
     function afterInitialize(uint256, uint256) external pure override returns (uint256, uint256) {
         return (BASE_FEE, BASE_FEE);
     }
 
     function afterSwap(TradeInfo calldata trade) external override returns (uint256, uint256) {
-        uint256 idx = readSlot(SLOT_IDX);
-        uint256 lastTs = readSlot(SLOT_LAST_TS);
+        uint256 rawLastEpoch = readSlot(SLOT_LAST_EPOCH);
+        uint256 rawLastTs = readSlot(SLOT_LAST_TS);
         uint256 sum = readSlot(SLOT_SUM);
         uint256 stepsSeen = readSlot(SLOT_STEPS);
         uint256 size = trade.amountY;
 
-        // Advance the circular buffer for each new step since the last trade.
-        // Steps with no trades get zero volume recorded.
-        if (lastTs > 0 && trade.timestamp > lastTs) {
-            uint256 gap = trade.timestamp - lastTs;
-            if (gap > WINDOW) gap = WINDOW;
+        uint256 currEpoch = trade.timestamp / STEPS_PER_BUCKET;
 
-            for (uint256 i = 0; i < gap; i++) {
-                idx = (idx + 1) % WINDOW;
-                uint256 old = readSlot(idx);
-                sum = sum > old ? sum - old : 0;
-                writeSlot(idx, 0);
+        // Track total steps elapsed (rawLastTs stores ts+1, so 0 = uninitialized)
+        if (rawLastTs > 0) {
+            uint256 actualLastTs = rawLastTs - 1;
+            if (trade.timestamp > actualLastTs) {
+                stepsSeen += trade.timestamp - actualLastTs;
             }
-            stepsSeen += gap;
         }
 
-        // Compute TWAP from historical buffer *before* including the current trade.
-        // This way we compare the incoming trade against prior history only.
+        // Clear stale buckets when we enter new epoch(s)
+        if (rawLastEpoch > 0) {
+            uint256 actualLastEpoch = rawLastEpoch - 1;
+            if (currEpoch > actualLastEpoch) {
+                uint256 epochGap = currEpoch - actualLastEpoch;
+                if (epochGap >= NUM_BUCKETS) {
+                    // Gap exceeds full window — clear everything
+                    for (uint256 i = 0; i < NUM_BUCKETS; i++) {
+                        writeSlot(i, 0);
+                    }
+                    sum = 0;
+                } else {
+                    // Clear only the buckets we're rotating past
+                    for (uint256 i = 1; i <= epochGap; i++) {
+                        uint256 clearIdx = (actualLastEpoch + i) % NUM_BUCKETS;
+                        uint256 old = readSlot(clearIdx);
+                        sum = sum > old ? sum - old : 0;
+                        writeSlot(clearIdx, 0);
+                    }
+                }
+            }
+        }
+
+        // Compute TWAP from historical data *before* including current trade
         uint256 twap = sum / WINDOW;
 
-        // Accumulate the current trade's volume into the current slot.
-        uint256 cur = readSlot(idx);
-        writeSlot(idx, cur + size);
+        // Accumulate current trade volume into its epoch bucket
+        uint256 bucketIdx = currEpoch % NUM_BUCKETS;
+        uint256 cur = readSlot(bucketIdx);
+        writeSlot(bucketIdx, cur + size);
         sum += size;
 
         // Spike fee if the incoming trade exceeds the historical TWAP
-        // (only after the warmup window so the TWAP is meaningful).
         uint256 fee = BASE_FEE;
         if (stepsSeen >= WINDOW && twap > 0 && size > twap) {
             fee = BASE_FEE + SPIKE_ADD;
         }
 
-        writeSlot(SLOT_IDX, idx);
-        writeSlot(SLOT_LAST_TS, trade.timestamp);
+        writeSlot(SLOT_LAST_EPOCH, currEpoch + 1);
+        writeSlot(SLOT_LAST_TS, trade.timestamp + 1);
         writeSlot(SLOT_SUM, sum);
         writeSlot(SLOT_STEPS, stepsSeen);
 
